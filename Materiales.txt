@@ -1,0 +1,9 @@
+Esp32 cualquier tipo
+Motor con encoder
+	1A 5V - PC
+	2A 12V
+Puente H
+	L298N
+Controlador alta frecuencia (ESP32/STM32)
+Pendulo
+
