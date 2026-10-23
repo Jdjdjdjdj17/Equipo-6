@@ -1,0 +1,13 @@
+{
+    "recommendations": [
+        "Jason2866.esp-decoder",
+        "alexnesnes.teleplot",
+        "ms-python.python",
+        "pioarduino.pioarduino-ide",
+        "platformio.platformio-ide",
+        "tomoki1207.pdf"
+    ],
+    "unwantedRecommendations": [
+        "ms-vscode.cpptools-extension-pack"
+    ]
+}

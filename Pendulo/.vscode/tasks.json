@@ -1,0 +1,23 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Graficar en vivo (ESP32)",
+      "type": "shell",
+      "command": "python herramientas/graficar.py",
+      "problemMatcher": []
+    },
+    {
+      "label": "Graficar simulado (sin ESP32)",
+      "type": "shell",
+      "command": "python herramientas/graficar.py --simular",
+      "problemMatcher": []
+    },
+    {
+      "label": "Instalar librerias de Python",
+      "type": "shell",
+      "command": "python -m pip install -r herramientas/requirements.txt",
+      "problemMatcher": []
+    }
+  ]
+}
