@@ -11,6 +11,9 @@ const float VEL_CAL = 15, TOL = 1.5;
 Preferences prefs;
 enum Modo { VEL, POS, PERFIL, TRAY, CAL, CERO } modo = VEL;
 float tr0 = 0, trD = 0, trT = 1; uint32_t tTr = 0;  // para mv
+float base = 0;  // las graficas de posicion empiezan en 0 en cada movimiento
+int nSec = 0, iSec = 0, secP[8]; float secA[8], secT[8], secX[8];  // perfiles en cadena
+float I_CERO = 0, K_I = 1, mAraw = 0, rpmS = 0;  // calibracion de corriente y rpm del sensor
 float rpm = 0, ref = 0, refObj = 0, integ = 0, objDeg = 0, vCmd = 0, u = 0, refAnt = 0, acel = 0, errMin = 1e9;
 float voltios = 0, mA = 0; bool inaOk = false, moviendo = false, monitorOn = false, repetir = false; int sgAnt = 0;
 const char *PERF[] = { "const", "rampa", "trap", "seno", "escalon", "exp", "gauss", "sierra", "ruido" };
@@ -19,7 +22,7 @@ float pA = 100, pT = 10, pX = 0, ruido = 0; int perfil = 0; uint32_t tPerf = 0, 
 const float KP_POS = 1.5, VEL_MAX_TR = 110;
 int sEst = HIGH, nMarcas = 0; long marca = 0, marcas[3], inicioCal = 0; uint32_t tCal = 0, nPasos = 0;
 bool hayMarca = false, marcaNueva = false, sVisto = false;
-volatile long tIniC = 0, tMarca = 0, tAncho = 0; volatile bool tDentro = false, tNueva = false;
+volatile long tIniC = 0, tMarca = 0, tAncho = 0; volatile bool tDentro = false, tNueva = false; volatile uint32_t usPaso = 0;
 // encoder
 volatile long enc = 0; volatile uint8_t encSt = 0; long cuentaPrev = 0;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -32,7 +35,7 @@ void IRAM_ATTR isrTcrt() {
   bool det = digitalRead(TCRT) == LOW; static uint32_t us0 = 0; uint32_t us = micros();
   portENTER_CRITICAL_ISR(&mux);
   if (det && !tDentro) { tDentro = true; tIniC = enc; us0 = us; }
-  else if (!det && tDentro) { tDentro = false; if (us - us0 > 300) { tAncho = enc - tIniC; tMarca = (tIniC + enc) / 2; tNueva = true; } }
+  else if (!det && tDentro) { tDentro = false; if (us - us0 > 300) { tAncho = enc - tIniC; tMarca = (tIniC + enc) / 2; usPaso = us0 + (us - us0) / 2; tNueva = true; } }
   portEXIT_CRITICAL_ISR(&mux);
 }
 long leerEnc() { portENTER_CRITICAL(&mux); long c = enc; portEXIT_CRITICAL(&mux); return c; }
@@ -81,7 +84,8 @@ int16_t inaReg(uint8_t r) {
   Wire.requestFrom((int)INA, 2); if (Wire.available() < 2) return 0;
   uint8_t h = Wire.read(), l = Wire.read(); return (int16_t)((h << 8) | l);
 }
-void leerINA() { if (inaOk) { voltios = ((uint16_t)inaReg(2) >> 3) * 0.004f; mA = inaReg(1) * 0.1f; } }  // shunt de 0.1
+void leerINA() { if (inaOk) { voltios = ((uint16_t)inaReg(2) >> 3) * 0.004f; mAraw = inaReg(1) * 0.1f; mA = (mAraw - I_CERO) * K_I; } }  // shunt de 0.1
+float promedioINA() { float s = 0; for (int i = 0; i < 50; i++) { s += inaReg(1) * 0.1f; delay(10); } return s / 50; }
 // perfiles
 float refPerfil(float t) {
   float r = 0, x = pX;
@@ -103,6 +107,10 @@ float refPerfil(float t) {
   }
   return constrain(r, 0.0f, 130.0f);
 }
+void cargar(int i) {
+  perfil = secP[i]; pA = secA[i]; pT = secT[i]; pX = secX[i]; tPerf = millis(); integ = 0;
+  Serial.printf("# PERFIL_INICIO,%s,%.1f,%.1f,%.2f\n", PERF[perfil], pA, pT, pX);
+}
 // calibracion
 void parar() {
   if (modo == PERFIL) Serial.printf("# PERFIL_FIN,%s,parado\n", PERF[perfil]);
@@ -117,7 +125,7 @@ void iniciarCal(Modo m) {
 void finCal(long c0, const char *q) {
   long k = lround((double)(leerEnc() - c0) / CPR);
   moverCero(c0 + lround(k * (double)CPR));
-  modo = POS; objDeg = 0; moviendo = true; vCmd = 0; integ = 0;
+  modo = POS; objDeg = 0; base = 0; moviendo = true; vCmd = 0; integ = 0;
   Serial.printf("# CERO listo (%s): estoy en %.1f grados, regreso a 0\n", q, grados());
 }
 float pasoCal(float dt) {
@@ -140,6 +148,7 @@ void ayuda() {
   Serial.println("# v = velocidad | p = posicion | numero = RPM o grados | s = parar | c / BOOT = calibrar | r = grados a 0");
   Serial.println("# cero = ir al 0 del sensor | of = aprender offset (of 10 = a mano) | m = monitor | g = estado");
   Serial.println("# pf <const|rampa|trap|seno|escalon|exp|gauss|sierra|ruido> [A T extra] | pa pt px = valores | rep = repetir");
+  Serial.println("# en cadena: pf sierra 100 20 5, trap 100 20 4 | ci = cero de corriente (motor parado), ci 350 = ajuste con multimetro");
   Serial.println("# mv <grados> [segundos] = trayectoria con aceleracion, avance y frenado (ej. mv 360 2)");
   Serial.println("# ajustes: pm ra vp kp ki il vb tx | fm 2 = Teleplot, fm 0 = graficar.py  (ej. tx 50)");
 }
@@ -148,6 +157,7 @@ void estado() {
                 inaOk ? "OK" : "NO", voltios, mA, lcdAddr ? "OK" : "NO", sEst == LOW ? "DETECTA" : "libre");
   Serial.printf("# perfil A=%.0f T=%.1f extra=%.2f | pm %d ra %.0f vp %.0f kp %.2f ki %.2f il %.0f vb %.1f tx %d fm %d\n",
                 pA, pT, pX, PWM_MIN, RAMPA, VEL_POS, Kp, Ki, I_LIM, V_BAJO, periodoTx, formato);
+  Serial.printf("# corriente: cero %.1f mA, ganancia %.3f | rpm del sensor %.1f | perfiles en cadena %d\n", I_CERO, K_I, rpmS, nSec);
 }
 bool ajustar(const String &k, float v) {
   if (k == "pa") pA = constrain(v, 0.0f, 130.0f); else if (k == "pt") pT = max(1.0f, v); else if (k == "px") pX = max(0.0f, v);
@@ -156,39 +166,64 @@ bool ajustar(const String &k, float v) {
   else if (k == "vb") V_BAJO = v; else if (k == "tx") prefs.putInt("tx", periodoTx = v); else if (k == "fm") prefs.putInt("fm", formato = v); else return false;
   return true;
 }
+void datos(float o, float p) {
+  if (formato == 2) Serial.printf(">ref:%.1f\n>rpm:%.1f\n>obj:%.1f\n>pos:%.1f\n>pwm:%.0f\n>mA:%.0f\n>V:%.2f\n>sensor:%d\n>pasos:%lu\n>rpmS:%.1f\n",
+                                  ref, rpm, o, p, u, mA, voltios, sVisto, (unsigned long)nPasos, rpmS);
+  else Serial.printf("D,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.0f,%.1f,%.3f,%d,%.2f\n", (unsigned long)millis(), modo == TRAY ? 1 : min((int)modo, 3),
+                     ref, rpm, o, p, u, mA, voltios, sVisto, acel);
+  sVisto = false;
+}
+void nuevaBase() { if (periodoTx) datos(0, 0); base = grados(); }  // el objetivo y la posicion arrancan en 0
 void comando(String c) {
   c.trim(); c.toLowerCase(); if (!c.length()) return;
   int sp = c.indexOf(' '); String k = sp < 0 ? c : c.substring(0, sp);
   float v = sp < 0 ? 0 : c.substring(sp + 1).toFloat();
   if (isDigit(c[0]) || ((c[0] == '-' || c[0] == '+') && c.length() > 1)) {
-    if (modo == POS) { objDeg = grados() + c.toFloat(); moviendo = true; Serial.printf("# Girando %.1f grados\n", c.toFloat()); }
+    if (modo == POS) { nuevaBase(); objDeg = grados() + c.toFloat(); moviendo = true; Serial.printf("# Girando %.1f grados\n", c.toFloat()); }
     else { if (modo != VEL) parar(); refObj = constrain(c.toFloat(), 0.0f, 130.0f); Serial.printf("# Objetivo %.0f RPM\n", refObj); }
   }
   else if (k == "v") { parar(); Serial.println("# MODO VELOCIDAD (1..130 RPM)"); }
-  else if (k == "p") { parar(); modo = POS; ref = 0; objDeg = grados(); Serial.println("# MODO POSICION (grados a girar)"); }
+  else if (k == "p") { parar(); modo = POS; ref = 0; objDeg = grados(); base = objDeg; Serial.println("# MODO POSICION (grados a girar)"); }
   else if (k == "s") { if (modo == POS) { moviendo = false; objDeg = grados(); } else parar(); Serial.println("# Parar"); }
   else if (k == "c") iniciarCal(CAL);
   else if (k == "cero") iniciarCal(CERO);
-  else if (k == "r" || k == "z") { moverCero(leerEnc()); objDeg = 0; moviendo = false; Serial.println("# Este punto ahora es 0 grados"); }
+  else if (k == "r" || k == "z") { moverCero(leerEnc()); objDeg = 0; base = 0; moviendo = false; Serial.println("# Este punto ahora es 0 grados"); }
   else if (k == "of") {
     if (sp > 0) OFFSET = v;
     else if (hayMarca) { float m = fmodf(marca / CPR * 360, 360); if (m > 180) m -= 360; if (m < -180) m += 360; OFFSET = -m; }
     else { Serial.println("# Primero haz que el brazo pase por el sensor (p y luego 360)"); return; }
     prefs.putFloat("of", OFFSET); Serial.printf("# Offset del sensor = %.1f grados (guardado)\n", OFFSET);
   }
-  else if (k == "pf") {
-    String t = sp < 0 ? "" : c.substring(sp + 1);
-    int s2 = t.indexOf(' '); String nom = s2 < 0 ? t : t.substring(0, s2);
-    int i = 0; while (i < 9 && nom != PERF[i]) i++;
-    if (i == 9) { Serial.println("# Perfiles: const rampa trap seno escalon exp gauss sierra ruido"); return; }
-    if (s2 > 0) { float a[3] = { pA, pT, 0 }; sscanf(t.substring(s2 + 1).c_str(), "%f %f %f", &a[0], &a[1], &a[2]); pA = a[0]; pT = a[1]; pX = a[2]; }
-    parar(); perfil = i; pA = constrain(pA, 0.0f, 130.0f); pT = max(1.0f, pT); modo = PERFIL; tPerf = millis(); integ = 0;
-    Serial.printf("# PERFIL_INICIO,%s,%.1f,%.1f,%.2f\n", PERF[i], pA, pT, pX);
+  else if (k == "pf") {  // pf sierra 100 20 5, trap 100 20 4, ...
+    String t = sp < 0 ? "" : c.substring(sp + 1); t.replace("+", ",");
+    int n = 0; float a = pA, T = pT, x = pX;
+    while (t.length() && n < 8) {
+      int coma = t.indexOf(','); String parte = coma < 0 ? t : t.substring(0, coma); t = coma < 0 ? "" : t.substring(coma + 1);
+      parte.trim(); int s2 = parte.indexOf(' '); String nom = s2 < 0 ? parte : parte.substring(0, s2);
+      int i = 0; while (i < 9 && nom != PERF[i]) i++;
+      if (i == 9) { Serial.printf("# No conozco '%s'. Perfiles: const rampa trap seno escalon exp gauss sierra ruido\n", nom.c_str()); return; }
+      if (s2 > 0) { float b[3] = { a, T, 0 }; sscanf(parte.substring(s2 + 1).c_str(), "%f %f %f", &b[0], &b[1], &b[2]); a = b[0]; T = b[1]; x = b[2]; }
+      secP[n] = i; secA[n] = constrain(a, 0.0f, 130.0f); secT[n] = max(1.0f, T); secX[n] = x; n++;
+    }
+    if (!n) { Serial.println("# Ejemplo: pf trap 100 20 4   o en cadena: pf sierra 100 20 5, trap 100 20 4"); return; }
+    parar(); nSec = n; iSec = 0; modo = PERFIL; cargar(0);
+    if (n > 1) Serial.printf("# Cadena de %d perfiles%s\n", n, repetir ? " (se repite)" : "");
+  }
+  else if (k == "ci") {  // ci = cero de corriente con el motor parado, ci 350 = ajustar con multimetro
+    if (!inaOk) { Serial.println("# No encuentro el INA219"); return; }
+    if (sp < 0) {
+      parar(); motor(0); delay(300); I_CERO = promedioINA(); prefs.putFloat("ic", I_CERO);
+      Serial.printf("# Cero de corriente = %.1f mA (guardado)\n", I_CERO);
+    } else {
+      float r = promedioINA() - I_CERO;
+      if (fabsf(r) < 20) { Serial.println("# Pon el motor a girar y escribe ci con lo que marca el multimetro (ej. ci 350)"); return; }
+      K_I = v / r; prefs.putFloat("ki2", K_I); Serial.printf("# Ganancia de corriente = %.3f (guardado)\n", K_I);
+    }
   }
   else if (k == "mv") {  // trayectoria
     float a[2] = { 0, 0 }; sscanf(c.substring(sp + 1).c_str(), "%f %f", &a[0], &a[1]);
     float tMin = fabsf(a[0]) / (VEL_MAX_TR * 6) * 4 / 3;
-    parar(); modo = TRAY; tr0 = grados(); trD = a[0]; trT = max(max(a[1], tMin), 0.3f); tTr = millis(); integ = 0; sgAnt = 0;
+    parar(); nuevaBase(); modo = TRAY; tr0 = grados(); trD = a[0]; trT = max(max(a[1], tMin), 0.3f); tTr = millis(); integ = 0; sgAnt = 0;
     if (a[1] > 0 && a[1] < tMin) Serial.printf("# Muy rapido para el motor: lo hago en %.2f s\n", trT);
     Serial.printf("# PERFIL_INICIO,tray,%.1f,%.2f,0\n", trD, trT);
   }
@@ -203,6 +238,7 @@ void setup() {
   Serial.begin(115200); delay(300);
   prefs.begin("pendulo", false); CPR = prefs.getFloat("cpr", CPR); OFFSET = prefs.getFloat("of", 0);
   periodoTx = prefs.getInt("tx", 0); formato = prefs.getInt("fm", 0);
+  I_CERO = prefs.getFloat("ic", 0); K_I = prefs.getFloat("ki2", 1);
   pwmIni(); motor(0);
   pinMode(ENC_A, INPUT_PULLUP); pinMode(ENC_B, INPUT_PULLUP); pinMode(TCRT, INPUT); pinMode(BOOT, INPUT_PULLUP);
   encSt = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
@@ -232,7 +268,13 @@ void loop() {
   if (ahora - tIna >= 20) { tIna = ahora; leerINA(); }
   portENTER_CRITICAL(&mux); bool nueva = tNueva; tNueva = false; long mk = tMarca, an = tAncho; sEst = tDentro ? LOW : HIGH; portEXIT_CRITICAL(&mux);
   marcaNueva = false; if (sEst == LOW) sVisto = true;
-  if (nueva && labs(an) < CPR / 4) { marca = mk; hayMarca = marcaNueva = sVisto = true; nPasos++; }
+  static uint32_t usAnt = 0; static bool sLcdTmp = false;
+  if (nueva && labs(an) < CPR / 4) {
+    marca = mk; hayMarca = marcaNueva = sVisto = sLcdTmp = true; nPasos++;
+    uint32_t us = usPaso; if (usAnt && us - usAnt > 50000) rpmS = 60e6f / (us - usAnt); usAnt = us;
+  }
+  if (usAnt && micros() - usAnt > 3000000) rpmS = 0;
+  if (sEst == LOW) sLcdTmp = true;
   if (digitalRead(BOOT) == LOW) { if (bootSuelto && ahora - tCal > 1000) { bootSuelto = false; iniciarCal(CAL); } }
   else bootSuelto = true;
   switch (modo) {
@@ -243,9 +285,13 @@ void loop() {
     }
     case PERFIL: {
       float t = (ahora - tPerf) / 1000.0f;
-      if (t >= pT && repetir) { tPerf = ahora; t = 0; }
-      if (t >= pT) { Serial.printf("# PERFIL_FIN,%s,completo\n", PERF[perfil]); modo = VEL; refObj = 0; u = 0; }
-      else { ref = refPerfil(t); u = ref > 0 ? pi(ref, dt) : 0; }
+      if (t >= pT) {
+        Serial.printf("# PERFIL_FIN,%s,completo\n", PERF[perfil]);
+        if (iSec + 1 < nSec) { cargar(++iSec); t = 0; }
+        else if (repetir) { iSec = 0; cargar(0); t = 0; }
+        else { modo = VEL; refObj = 0; u = 0; break; }
+      }
+      ref = refPerfil(t); u = ref > 0 ? pi(ref, dt) : 0;
       break;
     }
     case CAL: case CERO: ref = VEL_CAL; u = pasoCal(dt); break;
@@ -289,21 +335,17 @@ void loop() {
   int per = periodoTx ? ((modo == PERFIL || modo >= TRAY) ? 20 : periodoTx) : 0;
   if (per && ahora - tTx >= (uint32_t)per) {
     tTx = ahora;
-    if (formato == 2) Serial.printf(">ref:%.1f\n>rpm:%.1f\n>obj:%.1f\n>pos:%.1f\n>pwm:%.0f\n>mA:%.0f\n>V:%.2f\n>sensor:%d\n>pasos:%lu\n",
-                                    ref, rpm, objDeg, grados(), u, mA, voltios, sVisto, (unsigned long)nPasos);
-    else Serial.printf("D,%lu,%d,%.2f,%.2f,%.2f,%.2f,%.0f,%.1f,%.3f,%d,%.2f\n", (unsigned long)ahora, modo == TRAY ? 1 : min((int)modo, 3),
-                  ref, rpm, objDeg, grados(), u, mA, voltios, sVisto, acel);
-    sVisto = false;
+    datos(objDeg - base, grados() - base);
   }
   if (ahora - tLcd >= 250) { tLcd = ahora; char l1[17], l2[17];
     if (modo == POS || modo == TRAY) snprintf(l1, 17, "P%7.1f>%7.1f", objDeg, grados());
     else if (modo >= CAL)  snprintf(l1, 17, "CALIBRANDO  m%d", nMarcas);
     else                   snprintf(l1, 17, "%-7s%4.0f>%4.0f", modo == PERFIL ? PERF[perfil] : "VEL", ref, rpm);
-    snprintf(l2, 17, "%5.2fV %5.0fmA %c", voltios, mA, sEst == LOW ? '*' : ' ');
+    snprintf(l2, 17, "%5.2fV %5.0fmA %c", voltios, mA, sLcdTmp ? '*' : ' '); sLcdTmp = false;
     lcdLinea(0, l1); lcdLinea(1, l2);
   }
   if (monitorOn && ahora - tMon >= 300) { tMon = ahora;
-    Serial.printf("# RPM %6.1f | Pos %8.1f (obj %7.1f) | Sensor %-7s %4lu pasos | %5.2f V | %5.0f mA | %4.1f W | PWM %5.0f\n",
-                  rpm, grados(), objDeg, sEst == LOW ? "DETECTA" : "libre", (unsigned long)nPasos, voltios, mA, voltios * mA / 1000, u);
+    Serial.printf("# RPM %6.1f | Pos %8.1f (obj %7.1f) | Sensor %-7s %4lu pasos %5.1f rpm | %5.2f V | %5.0f mA | %4.1f W | PWM %5.0f\n",
+                  rpm, grados(), objDeg, sEst == LOW ? "DETECTA" : "libre", (unsigned long)nPasos, rpmS, voltios, mA, voltios * mA / 1000, u);
   }
 }

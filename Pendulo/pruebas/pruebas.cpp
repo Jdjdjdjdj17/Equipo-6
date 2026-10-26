@@ -1,3 +1,25 @@
+/*
+  PRUEBA POR PARTES – Péndulo PID (ESP32)
+  ---------------------------------------
+  Un solo programa para probar cada componente por separado.
+  No necesita librerías extra (la LCD y el INA219 se manejan directo por I2C).
+
+  Monitor Serie: 115200 baud, "Nueva línea".
+  Escribe el número de la prueba y Enter. Escribe x para salir de una prueba continua.
+
+    1  Buscar dispositivos I2C (LCD 0x27, INA219 0x40)
+    2  Probar la LCD
+    3  Encoder (gira el motor A MANO)
+    4  Sensor TCRT5000 (pasa el rayo frente al sensor)
+    5  INA219 (voltaje y corriente)
+    6  Motor: adelante 3 s, lento
+    7  Motor: atrás 3 s, lento
+    8  Motor + encoder + INA219 juntos (adelante 4 s)
+
+  Pines (igual que el diagrama de conexión):
+    SDA 21, SCL 22 | Encoder A 23, B 18 | IN3 26, IN4 27 | TCRT D0 19
+*/
+
 #include <Arduino.h>
 #include <Wire.h>
 
